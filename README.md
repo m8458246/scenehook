@@ -127,6 +127,7 @@ if (value.startsWith("success@")) {
   "enabled": true,
   "mode": "trial",
   "expiry": "2099-12-31",
+  "block_update": true,
   "debug": false
 }
 ```
@@ -136,7 +137,8 @@ if (value.startsWith("success@")) {
 | `enabled` | `true` | 关掉后全部 hook 直接 `proceed()`，等于原版行为 |
 | `mode` | `trial` | `trial` = 永远试用期（显示 Pro(Trial)）；`perpetual` = 永久授权（显示 Pro(Permanent)） |
 | `expiry` | `2099-12-31` | 展示用的到期日，同时换算成时间戳喂给判决 |
-| `debug` | `false` | 打开后每次判决都打一行日志 |
+| `block_update` | `true` | 掐断 `/release-activate2` 与 `download-profile`，保住本地 profile，启动不再等 15 秒超时 |
+| `debug` | `false` | 打开后打印每次 daemon IPC 的 API 名与耗时，用来定位"慢在哪" |
 
 文件不存在时用内置默认值（即已启用、试用期到 2099-12-31），**开箱即用，不建文件也行**。
 配置有 3 秒 TTL，改完不用重启 App。

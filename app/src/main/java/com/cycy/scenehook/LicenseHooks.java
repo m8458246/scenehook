@@ -10,32 +10,43 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 /**
- * Scene 授权 hook。
+ * Scene 授权 hook（v1.1）。
  *
- * 逆向结论（Scene 9.4.11 / com.omarea.vtools，versionCode 920260809）：
+ * ===== 逆向结论（Scene 9.4.11 / com.omarea.vtools，versionCode 920260809）=====
  *
- *   启动页 ActivityStartSplash$h.run()
- *     └─ new a.dp0(context).d()  → ActivatedStateModel
- *          └─ type = prefs["activate_v2_type"]        (a.t01.b())
- *          └─ text = c(prefs 里的授权串)               (a.dp0.c)
- *                └─ a.cp0.c() = a.q50.A(prefs["random_id2"])
- *                      └─ 把激活码发到服务端，返回 "success@<到期毫秒>" / "expired" / "invalid" ...
+ * 1) 授权判定链路（全在 Java 层）：
+ *      ActivityStartSplash$h.run()
+ *        └─ new a.dp0(ctx).d()            → ActivatedStateModel
+ *             ├─ type = a.t01.b()          prefs["activate_v2_type"]
+ *             └─ text = a.dp0.c(label)     → a.cp0.c() → a.q50.A(prefs["random_id2"])
+ *    a.q50.A(code) 本身不判断，它把 code 丢给 scene-daemon（127.0.0.1:14754），
+ *    由 daemon 发 HTTP 到 omarea.com 拿 "success@<到期毫秒>" / "expired" / "invalid"。
+ *    真正的"到期"比较发生在服务端，而请求时间由 daemon 用**本机时钟**生成
+ *    —— 这就是改系统日期能续试用期的原因。
  *
- * 也就是说：到期与否是**服务端**判的，但请求里带的是本地时间（request_time = new Date()），
- * 所以把系统日期改到试用期内就能继续用 —— 这正是用户实测到的现象。
+ * 2) App 自身没有任何"按日期砍功能"的逻辑（全量 grep 过 currentTimeMillis），
+ *    所以功能多寡不取决于 Java 层的时间判断。
  *
- * 因此最小侵入的 hook 点就是那个"判决出口" a.q50.A(String)：
- * 直接返回 "success@<远期时间戳>"，整条链路的 activated 就恒为 true。
- * 另外再用 a.dp0.d() / a.t01.b() / getActivated() 兜底，防止任何分支把状态翻回去。
+ * 3) 真正影响功能与速度的是网络：启动时会走
+ *      · a.zq0.A() → GET /release-activate2?t=<本机时间>       （授权同步）
+ *      · a.q50.F(branch) → O0("download-profile", …, 15000L)   （云端配置，超时 15 秒）
+ *    日期一旦过期，这两个请求要么被服务端拒，要么长时间等超时 —— 表现为"变慢"，
+ *    并且可能把本地那份完好的 profile/manifest 冲掉 —— 表现为"功能变少"。
+ *
+ * ===== 因此本模块做三件事 =====
+ *   A. 授权状态恒为"已激活的完整试用"（5 个 hook，等价于把日期改回试用期内）
+ *   B. 掐断上面两个联网刷新（可配置），保住本地已有的 profile，启动不再等超时
+ *   C. daemon IPC 层统一兜底：O0("activate") 直接给成功，任何路径都绕不过
  */
 final class LicenseHooks {
 
     private static final String TAG = "SceneHook";
 
-    // 以下类名来自 9.4.11 的混淆结果，App 升级后可能变化；找不到时静默降级
-    private static final String CLS_Q50 = "a.q50";                      // 授权判决（服务端交互）
-    private static final String CLS_DP0 = "a.dp0";                      // 授权状态机
-    private static final String CLS_T01 = "a.t01";                      // SharedPreferences 读写
+    // 9.4.11 的混淆名，App 升级后可能变化；找不到时静默降级
+    private static final String CLS_Q50 = "a.q50";        // scene-daemon IPC 客户端
+    private static final String CLS_DP0 = "a.dp0";        // 授权状态机
+    private static final String CLS_T01 = "a.t01";        // SharedPreferences 读写
+    private static final String CLS_ZQ0 = "a.zq0";        // /release-activate2 同步
     private static final String CLS_STATE = "com.omarea.model.ActivatedStateModel";
 
     private static final String PREF_TYPE = "activate_v2_type";
@@ -48,6 +59,12 @@ final class LicenseHooks {
 
     private Class<?> stateCls;
     private int installed;
+
+    // 资源查找按名字 getIdentifier 比较贵，而文案是固定的，缓存一份就够
+    private static volatile String sExpiryLabel;
+    private static volatile String sTrialName;
+    private static volatile String sPerpetualName;
+    private static volatile boolean sResolved;
 
     private LicenseHooks(XposedModule module, ClassLoader cl) {
         this.module = module;
@@ -62,19 +79,24 @@ final class LicenseHooks {
         Class<?> q50 = find(CLS_Q50);
         Class<?> dp0 = find(CLS_DP0);
         Class<?> t01 = find(CLS_T01);
+        Class<?> zq0 = find(CLS_ZQ0);
         stateCls = find(CLS_STATE);
 
         hookVerdict(q50);
+        hookDaemonIpc(q50);
         hookStateGetter(dp0);
         hookStateParser(dp0);
         hookLicenseType(t01);
         hookActivatedFlag(stateCls);
+        hookCloudSync(zq0);
 
-        module.log(Log.INFO, TAG, "SceneHook 安装完成: " + installed + "/5 个 hook 生效, "
+        Config c = Config.current();
+        module.log(Log.INFO, TAG, "SceneHook 安装完成: " + installed + "/7 个 hook 生效, "
                 + "配置来源=" + Config.source()
-                + ", enabled=" + Config.current().enabled
-                + ", mode=" + Config.current().mode
-                + ", expiry=" + Config.current().expiry);
+                + ", enabled=" + c.enabled
+                + ", mode=" + c.mode
+                + ", expiry=" + c.expiry
+                + ", blockUpdate=" + c.blockUpdate);
         selfCheck();
     }
 
@@ -82,8 +104,7 @@ final class LicenseHooks {
 
     /**
      * a.q50.A(String) → 授权判决。
-     * 原实现是 O0("activate", code, 2500) 打到服务端，失败重试到 6 秒。
-     * 这里直接短路，既让状态恒为成功，也顺手省掉了启动时的网络等待。
+     * 原实现是 O0("activate", code, 2500)，失败重试到 6 秒。这里直接短路。
      */
     private void hookVerdict(Class<?> q50) {
         if (q50 == null) {
@@ -93,10 +114,9 @@ final class LicenseHooks {
         try {
             Method m = q50.getDeclaredMethod("A", String.class);
             m.setAccessible(true);
-            final String id = "scenehook_verdict";
             module.hook(m)
                     .setPriority(XposedInterface.PRIORITY_HIGHEST)
-                    .setId(id)
+                    .setId("scenehook_verdict")
                     .intercept(chain -> {
                         Config c = Config.current();
                         if (!c.enabled) return chain.proceed();
@@ -113,7 +133,63 @@ final class LicenseHooks {
         }
     }
 
-    /** a.dp0.d() → 状态机出口，直接把结果改写成已激活。 */
+    /**
+     * a.q50.O0(String api, String content, Long timeout) → 所有 app↔daemon 调用的唯一出口。
+     *
+     * 这里是"既要劫持发出去的请求、也要管住回来的结果"最合适的落点：
+     *   · activate          → 直接给 success，连 daemon 都不用问
+     *   · download-profile  → 可配置拦掉，避免 15 秒超时
+     *   · debug             → 打印每个 API 的耗时，用数据判断"慢在哪"
+     */
+    private void hookDaemonIpc(Class<?> q50) {
+        if (q50 == null) return;
+        try {
+            Method m = q50.getDeclaredMethod("O0", String.class, String.class, Long.class);
+            m.setAccessible(true);
+            module.hook(m)
+                    .setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .setId("scenehook_ipc")
+                    .intercept(chain -> {
+                        Config c = Config.current();
+                        if (!c.enabled) return chain.proceed();
+
+                        Object rawApi = chain.getArg(0);
+                        String api = (rawApi instanceof String) ? (String) rawApi : "";
+
+                        if ("activate".equals(api)) {
+                            String verdict = "success@" + c.expiryMillis();
+                            if (c.debug) module.log(Log.INFO, TAG, "O0(activate) -> " + verdict);
+                            return verdict;
+                        }
+
+                        if (c.blockUpdate && "download-profile".equals(api)) {
+                            module.log(Log.INFO, TAG, "O0(download-profile) 已拦截，保留本地 profile");
+                            return "";
+                        }
+
+                        if (!c.debug) return chain.proceed();
+
+                        long start = System.nanoTime();
+                        try {
+                            Object r = chain.proceed();
+                            long ms = (System.nanoTime() - start) / 1_000_000L;
+                            module.log(Log.INFO, TAG, "O0(" + api + ") " + ms + "ms -> "
+                                    + brief(r));
+                            return r;
+                        } catch (Throwable t) {
+                            long ms = (System.nanoTime() - start) / 1_000_000L;
+                            module.log(Log.WARN, TAG, "O0(" + api + ") " + ms + "ms 抛异常: " + t);
+                            throw t;
+                        }
+                    });
+            installed++;
+            module.log(Log.INFO, TAG, "hook OK: " + CLS_Q50 + "#O0(String,String,Long)");
+        } catch (Throwable t) {
+            module.log(Log.WARN, TAG, "hook " + CLS_Q50 + "#O0 失败: " + t);
+        }
+    }
+
+    /** a.dp0.d() → 状态机出口，把结果改写成已激活。 */
     private void hookStateGetter(Class<?> dp0) {
         if (dp0 == null) {
             module.log(Log.WARN, TAG, "找不到 " + CLS_DP0 + "，状态 hook 跳过");
@@ -226,6 +302,37 @@ final class LicenseHooks {
         }
     }
 
+    /**
+     * a.zq0.A() → 启动时那次 GET /release-activate2?t=&lt;本机时间&gt;。
+     * 直接返回 null 表示"没拿到数据"，走本地兜底；省掉一次必然失败的 HTTP，
+     * 也避免服务端据此把本地授权状态改差。
+     */
+    private void hookCloudSync(Class<?> zq0) {
+        if (zq0 == null) {
+            module.log(Log.WARN, TAG, "找不到 " + CLS_ZQ0 + "，云端同步 hook 跳过");
+            return;
+        }
+        try {
+            Method m = zq0.getDeclaredMethod("A");
+            m.setAccessible(true);
+            module.hook(m)
+                    .setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .setId("scenehook_cloud_sync")
+                    .intercept(chain -> {
+                        Config c = Config.current();
+                        if (!c.enabled || !c.blockUpdate) return chain.proceed();
+                        if (c.debug) {
+                            module.log(Log.INFO, TAG, "zq0.A() 已拦截（跳过 /release-activate2）");
+                        }
+                        return null;
+                    });
+            installed++;
+            module.log(Log.INFO, TAG, "hook OK: " + CLS_ZQ0 + "#A()");
+        } catch (Throwable t) {
+            module.log(Log.WARN, TAG, "hook " + CLS_ZQ0 + "#A 失败: " + t);
+        }
+    }
+
     // -------------------------------------------------------------- helpers
 
     /** 把状态模型改写成"已激活"，顺便修好展示文案。 */
@@ -238,12 +345,26 @@ final class LicenseHooks {
         setBool(model, "setPermanent", c.perpetual());
         setStr(model, "setType", c.perpetual() ? "perpetual" : "trial");
 
-        String typeName = resString(owner, c.perpetual() ? RES_PERPETUAL : RES_TRIAL);
+        Context ctx = findContext(owner);
+        resolveStrings(ctx);
+
+        String typeName = c.perpetual() ? sPerpetualName : sTrialName;
         if (typeName != null) setStr(model, "setTypeName", typeName);
 
-        String label = resString(owner, RES_EXPIRY);
-        if (label != null) setStr(model, "setText", label + c.expiry);
+        if (sExpiryLabel != null) setStr(model, "setText", sExpiryLabel + c.expiry);
         return model;
+    }
+
+    /** 资源文案只解析一次，之后走缓存 —— 避免每次状态刷新都做一次 getIdentifier。 */
+    private void resolveStrings(Context ctx) {
+        if (sResolved || ctx == null) return;
+        synchronized (LicenseHooks.class) {
+            if (sResolved) return;
+            sExpiryLabel = resString(ctx, RES_EXPIRY);
+            sTrialName = resString(ctx, RES_TRIAL);
+            sPerpetualName = resString(ctx, RES_PERPETUAL);
+            sResolved = true;
+        }
     }
 
     private Object newState() {
@@ -295,9 +416,7 @@ final class LicenseHooks {
     }
 
     /** 按名字取字符串资源，不写死 resource id，App 换版本也不会错位。 */
-    private String resString(Object owner, String name) {
-        Context ctx = findContext(owner);
-        if (ctx == null) return null;
+    private static String resString(Context ctx, String name) {
         try {
             int id = ctx.getResources().getIdentifier(name, "string", ctx.getPackageName());
             if (id == 0) return null;
@@ -315,7 +434,13 @@ final class LicenseHooks {
         }
     }
 
-    /** 装完就自检，不用等用户点进设置页也能从 logcat 判断是否生效。 */
+    private static String brief(Object o) {
+        if (o == null) return "null";
+        String s = String.valueOf(o);
+        return s.length() > 120 ? s.substring(0, 120) + "…" : s;
+    }
+
+    /** 装完就自检，不用等用户点进设置页也能从日志判断是否生效。 */
     private void selfCheck() {
         Config c = Config.current();
         Object model = newState();

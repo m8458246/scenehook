@@ -15,7 +15,8 @@ import java.util.Locale;
  * 所以只能走共享存储：/sdcard/Download/scenehook/config.json。
  *
  * 配置文件是扁平的 JSON 对象：
- *   { "enabled": true, "mode": "trial", "expiry": "2099-12-31", "debug": false }
+ *   { "enabled": true, "mode": "trial", "expiry": "2099-12-31",
+ *     "block_update": true, "debug": false }
  *
  * 这里没有用 org.json —— 只需要读 4 个标量字段，手写一个取值器就够，
  * 顺便把模块的依赖面压到零。
@@ -40,6 +41,8 @@ final class Config {
     String mode = "trial";
     /** yyyy-MM-dd，既是展示的到期日，也是喂给授权判定的时间戳 */
     String expiry = "2099-12-31";
+    /** 掐断云端授权同步 / 配置下载，保住本地已有 profile，也避免启动等超时 */
+    boolean blockUpdate = true;
     boolean debug = false;
 
     private static volatile Config cache;
@@ -84,6 +87,9 @@ final class Config {
 
             v = extract(text, "expiry");
             if (v != null && v.trim().length() > 0) c.expiry = v.trim();
+
+            v = extract(text, "block_update");
+            if (v != null) c.blockUpdate = "true".equalsIgnoreCase(v);
 
             v = extract(text, "debug");
             if (v != null) c.debug = "true".equalsIgnoreCase(v);
