@@ -1,5 +1,6 @@
 package com.cycy.scenehook;
 
+import android.app.Application;
 import android.content.Context;
 import android.util.Log;
 
@@ -89,9 +90,10 @@ final class LicenseHooks {
         hookLicenseType(t01);
         hookActivatedFlag(stateCls);
         hookCloudSync(zq0);
+        hookWorkingMode(q50);
 
         Config c = Config.current();
-        module.log(Log.INFO, TAG, "SceneHook 安装完成: " + installed + "/7 个 hook 生效, "
+        module.log(Log.INFO, TAG, "SceneHook 安装完成: " + installed + "/8 个 hook 生效, "
                 + "配置来源=" + Config.source()
                 + ", enabled=" + c.enabled
                 + ", mode=" + c.mode
@@ -333,7 +335,86 @@ final class LicenseHooks {
         }
     }
 
+    /**
+     * a.q50.h0() → 工作模式（"root" / "adb" / "basic"）。
+     *
+     * 原实现：
+     *     public final String h0() { return Y() ? e : "basic"; }
+     * 而 Y() 判断的是 daemon 是否就绪（f2606a == STATUS_RUNNING），
+     * f2606a 在每个新进程里都从 STATUS_STOP 开始 —— 于是启动初期 h0() 恒为 "basic"，
+     * 界面就先渲染成"基础功能"；等异步的 root 探测完成才变 "root"。
+     * 有些界面（如 vx1）还会在构造时把 isBasic 缓存成字段，所以"退出重进"才能恢复。
+     *
+     * 这是 Scene 自身的启动竞态，与本模块无关。这里在"上次成功过 root"的前提下
+     * 直接把 basic 顶替成上次的模式，让首次进入就是完整功能。
+     */
+    private void hookWorkingMode(Class<?> q50) {
+        if (q50 == null) return;
+        try {
+            Method m = q50.getDeclaredMethod("h0");
+            m.setAccessible(true);
+            module.hook(m)
+                    .setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .setId("scenehook_mode")
+                    .intercept(chain -> {
+                        Object raw = chain.proceed();
+                        Config c = Config.current();
+                        if (!c.enabled || !c.assumeRoot) return raw;
+                        String mode = (raw instanceof String) ? (String) raw : "basic";
+                        if (!"basic".equals(mode)) return mode;
+                        String saved = savedWorkingMode();
+                        if (saved != null && saved.length() > 0 && !"basic".equals(saved)) {
+                            if (c.debug) {
+                                module.log(Log.INFO, TAG, "h0() basic -> " + saved + "（沿用上次的工作模式）");
+                            }
+                            return saved;
+                        }
+                        return mode;
+                    });
+            installed++;
+            module.log(Log.INFO, TAG, "hook OK: " + CLS_Q50 + "#h0()");
+        } catch (Throwable t) {
+            module.log(Log.WARN, TAG, "hook " + CLS_Q50 + "#h0 失败: " + t);
+        }
+    }
+
     // -------------------------------------------------------------- helpers
+
+    private static volatile Application sApp;
+    private static volatile String sSavedMode;
+    private static volatile long sSavedAt = -1L;
+
+    /** 拿当前进程的 Application（模块跑在目标进程里，这条路是通的）。 */
+    private static Application app() {
+        if (sApp != null) return sApp;
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Method m = at.getDeclaredMethod("currentApplication");
+            m.setAccessible(true);
+            Object o = m.invoke(null);
+            if (o instanceof Application) sApp = (Application) o;
+        } catch (Throwable ignored) {
+        }
+        return sApp;
+    }
+
+    /** 读 Scene 自己记下的 working_mode（只有成功进过 root 才会是 "root"）。 */
+    private static String savedWorkingMode() {
+        long now = System.currentTimeMillis();
+        if (sSavedAt >= 0 && now - sSavedAt < 3000L && sSavedMode != null) {
+            return sSavedMode;
+        }
+        Application a = app();
+        if (a == null) return null;
+        try {
+            String v = a.getSharedPreferences("global", 0).getString("working_mode", "basic");
+            sSavedMode = v;
+            sSavedAt = now;
+            return v;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     /** 把状态模型改写成"已激活"，顺便修好展示文案。 */
     private Object forceActivated(Object model, Object owner, Config c) {

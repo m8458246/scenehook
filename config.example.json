@@ -3,5 +3,6 @@
   "mode": "trial",
   "expiry": "2099-12-31",
   "block_update": true,
+  "assume_root": true,
   "debug": false
 }

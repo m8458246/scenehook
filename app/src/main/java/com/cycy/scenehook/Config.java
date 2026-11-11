@@ -16,7 +16,7 @@ import java.util.Locale;
  *
  * 配置文件是扁平的 JSON 对象：
  *   { "enabled": true, "mode": "trial", "expiry": "2099-12-31",
- *     "block_update": true, "debug": false }
+ *     "block_update": true, "assume_root": true, "debug": false }
  *
  * 这里没有用 org.json —— 只需要读 4 个标量字段，手写一个取值器就够，
  * 顺便把模块的依赖面压到零。
@@ -43,6 +43,11 @@ final class Config {
     String expiry = "2099-12-31";
     /** 掐断云端授权同步 / 配置下载，保住本地已有 profile，也避免启动等超时 */
     boolean blockUpdate = true;
+    /**
+     * Scene 启动时 h0() 在 daemon 就绪前一律返回 "basic"，界面会先渲染成基础功能，
+     * 退出重进才恢复。打开这个开关后，用上次成功的工作模式顶替掉这个 "basic"。
+     */
+    boolean assumeRoot = true;
     boolean debug = false;
 
     private static volatile Config cache;
@@ -90,6 +95,9 @@ final class Config {
 
             v = extract(text, "block_update");
             if (v != null) c.blockUpdate = "true".equalsIgnoreCase(v);
+
+            v = extract(text, "assume_root");
+            if (v != null) c.assumeRoot = "true".equalsIgnoreCase(v);
 
             v = extract(text, "debug");
             if (v != null) c.debug = "true".equalsIgnoreCase(v);

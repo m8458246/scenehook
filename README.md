@@ -128,6 +128,7 @@ if (value.startsWith("success@")) {
   "mode": "trial",
   "expiry": "2099-12-31",
   "block_update": true,
+  "assume_root": true,
   "debug": false
 }
 ```
@@ -138,6 +139,7 @@ if (value.startsWith("success@")) {
 | `mode` | `trial` | `trial` = 永远试用期（显示 Pro(Trial)）；`perpetual` = 永久授权（显示 Pro(Permanent)） |
 | `expiry` | `2099-12-31` | 展示用的到期日，同时换算成时间戳喂给判决 |
 | `block_update` | `true` | 掐断 `/release-activate2` 与 `download-profile`，保住本地 profile，启动不再等 15 秒超时 |
+| `assume_root` | `true` | 修复"首次进入显示基础功能、退出重进才恢复 root"的启动竞态 |
 | `debug` | `false` | 打开后打印每次 daemon IPC 的 API 名与耗时，用来定位"慢在哪" |
 
 文件不存在时用内置默认值（即已启用、试用期到 2099-12-31），**开箱即用，不建文件也行**。
@@ -208,7 +210,32 @@ SceneHook 安装完成: 5/5 个 hook 生效, 配置来源=default, enabled=true,
 
 ---
 
-## 五、已知限制
+## 五、"首次进入是基础功能"的原因
+
+这不是模块造成的，是 Scene 自己的启动竞态：
+
+```java
+public final String h0() { return Y() ? e : "basic"; }
+
+public final boolean Y() {
+    return X() != null || f2607a.c() || (f2606a == STATUS_RUNNING && !f2622e);
+}
+```
+
+`f2606a` 是 daemon 状态，**每个新进程都从 `STATUS_STOP` 开始**，`e` 也从 `"basic"` 开始。
+所以 App 刚起来时 `h0()` 恒为 `"basic"`，界面先按基础功能渲染；等异步的 root 探测
+（`Z0()` → `e = "root"`）完成后才变完整功能。
+
+更麻烦的是有些界面会在**构造时**就把 `isBasic` 缓存成字段（如 `vx1.t`），
+所以只有"退出重进"才能让新 Activity 在 daemon 就绪后再构造一次。
+
+`assume_root = true` 时，模块在 `h0()` 返回 `"basic"` 时改读 Scene 自己存的
+`working_mode`（只有成功进过 root 才会是 `"root"`），用上次的成功模式顶替，
+首次进入即完整功能。若担心 daemon 真没起来时界面与实际能力不符，可置为 `false`。
+
+---
+
+## 六、已知限制
 
 1. **绑定版本**。`a.q50` / `a.dp0` / `a.t01` 是 9.4.11 的混淆名。App 升级后混淆映射会变，
    需要按「01/05 文档」的方法重新定位：从 `ActivatedStateModel` 的 xref 往上找

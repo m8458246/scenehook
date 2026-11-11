@@ -1,6 +1,6 @@
 name=SceneHook
-version=v1.1.0
-versionCode=3
+version=v1.2.0
+versionCode=4
 description=让 Scene 恒处于已激活的完整试用状态，无需修改系统日期
 minApiVersion=101
 targetApiVersion=102
