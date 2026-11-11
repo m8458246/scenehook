@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="SceneHook"
+        android:supportsRtl="true" />
+
+    <!-- 模块需要"看见"目标应用（Android 11+ 包可见性），也便于以后做跳转 -->
+    <queries>
+        <package android:name="com.omarea.vtools" />
+    </queries>
+
+</manifest>
