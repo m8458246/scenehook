@@ -127,8 +127,15 @@ final class LicenseHooks {
                     .setId("scenehook_state_d")
                     .intercept(chain -> {
                         Config c = Config.current();
-                        Object model = chain.proceed();
-                        if (!c.enabled) return model;
+                        if (!c.enabled) return chain.proceed();
+                        Object model;
+                        try {
+                            model = chain.proceed();
+                        } catch (Throwable t) {
+                            // prefs 里没有激活码时原实现会 NPE，这里兜住，绝不让启动页崩
+                            module.log(Log.WARN, TAG, "dp0.d() 原实现抛异常，改用兜底状态: " + t);
+                            model = null;
+                        }
                         return forceActivated(model, chain.getThisObject(), c);
                     });
             installed++;
@@ -149,8 +156,14 @@ final class LicenseHooks {
                     .setId("scenehook_state_c")
                     .intercept(chain -> {
                         Config c = Config.current();
-                        Object model = chain.proceed();
-                        if (!c.enabled) return model;
+                        if (!c.enabled) return chain.proceed();
+                        Object model;
+                        try {
+                            model = chain.proceed();
+                        } catch (Throwable t) {
+                            module.log(Log.WARN, TAG, "dp0.c() 原实现抛异常，改用兜底状态: " + t);
+                            model = null;
+                        }
                         return forceActivated(model, chain.getThisObject(), c);
                     });
             installed++;
