@@ -1,7 +1,7 @@
 name=SceneHook
-version=v1.2.0
-versionCode=4
-description=让 Scene 恒处于已激活的完整试用状态，无需修改系统日期
+version=v2.0.0
+versionCode=5
+description=Scene 恒处于已激活的完整 Pro，并彻底断网成为本地工具
 minApiVersion=101
 targetApiVersion=102
 autoHotReload=false

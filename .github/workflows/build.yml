@@ -59,11 +59,13 @@ jobs:
 
             **安装**：下载 `scenehook.apk` → 安装 → LSPosed 里启用模块并勾选 `com.omarea.vtools` → 强行停止 Scene 再打开。
 
-            **验证**：`logcat -s SceneHook:V` 应看到 `SceneHook 安装完成: 5/5 个 hook 生效`。
+            **验证**：`logcat -s SceneHook:V` 应看到 `授权类 10/10 个 hook 生效` 与 `断网 hook: 2/2 生效, 闸门自检=PASS`。
 
-            **配置**：`/sdcard/Download/scenehook/config.json`
+            **配置**：`/sdcard/Download/scenehook/config.json`（不建文件也能用，默认已启用 + 断网）
             ```json
-            { "enabled": true, "mode": "trial", "expiry": "2099-12-31", "debug": false }
+            { "enabled": true, "mode": "trial", "expiry": "2099-12-31",
+              "offline": true, "block_update": true, "assume_root": true,
+              "force_pro": true, "trace_ipc": false, "debug": false }
             ```
           files: out/scenehook.apk
           fail_on_unmatched_files: true

@@ -16,9 +16,10 @@ import java.util.Locale;
  *
  * 配置文件是扁平的 JSON 对象：
  *   { "enabled": true, "mode": "trial", "expiry": "2099-12-31",
- *     "block_update": true, "assume_root": true, "debug": false }
+ *     "offline": true, "block_update": true, "assume_root": true,
+ *     "force_pro": true, "trace_ipc": false, "debug": false }
  *
- * 这里没有用 org.json —— 只需要读 4 个标量字段，手写一个取值器就够，
+ * 这里没有用 org.json —— 只需要读几个标量字段，手写一个取值器就够，
  * 顺便把模块的依赖面压到零。
  * 带 3 秒 TTL，避免每次读状态都碰文件系统。
  */
@@ -41,13 +42,38 @@ final class Config {
     String mode = "trial";
     /** yyyy-MM-dd，既是展示的到期日，也是喂给授权判定的时间戳 */
     String expiry = "2099-12-31";
+
+    /**
+     * 真正断网：把目标进程里所有 http/https 的 URL.openConnection 打成 IOException。
+     *
+     * Scene 的全部联网都走 java.net.URL（HTTP 客户端 a.h60 和另外 4 个直接
+     * openConnection 的类），所以在 URL 这一层设卡可以一次覆盖干净：
+     *   · 授权同步 /release-activate2、账号接口
+     *   · 云端配置 download-profile、cloud-scheduler
+     *   · 版本检查 vi/lastversion.json、Scene9.json
+     *   · Magisk 模块仓库 modules.json、广告跳过配置、pvp 上报
+     * 守护进程自己的 HTTP 走 IPC 层拦截（见 LicenseHooks#hookDaemonIpc）。
+     */
+    boolean offline = true;
+
     /** 掐断云端授权同步 / 配置下载，保住本地已有 profile，也避免启动等超时 */
     boolean blockUpdate = true;
+
     /**
      * Scene 启动时 h0() 在 daemon 就绪前一律返回 "basic"，界面会先渲染成基础功能，
      * 退出重进才恢复。打开这个开关后，用上次成功的工作模式顶替掉这个 "basic"。
      */
     boolean assumeRoot = true;
+
+    /**
+     * 免费版标志位（meta-data free_version）强制为「专业版」。
+     * 当前装的是 Pro 包，默认就是 false；这一项是为「万一是免费包」留的保险。
+     */
+    boolean forcePro = true;
+
+    /** 打印每一次 app↔daemon IPC 的 API 名（去重），用来排查还有没有漏网的联网 API */
+    boolean traceIpc = false;
+
     boolean debug = false;
 
     private static volatile Config cache;
@@ -93,11 +119,20 @@ final class Config {
             v = extract(text, "expiry");
             if (v != null && v.trim().length() > 0) c.expiry = v.trim();
 
+            v = extract(text, "offline");
+            if (v != null) c.offline = "true".equalsIgnoreCase(v);
+
             v = extract(text, "block_update");
             if (v != null) c.blockUpdate = "true".equalsIgnoreCase(v);
 
             v = extract(text, "assume_root");
             if (v != null) c.assumeRoot = "true".equalsIgnoreCase(v);
+
+            v = extract(text, "force_pro");
+            if (v != null) c.forcePro = "true".equalsIgnoreCase(v);
+
+            v = extract(text, "trace_ipc");
+            if (v != null) c.traceIpc = "true".equalsIgnoreCase(v);
 
             v = extract(text, "debug");
             if (v != null) c.debug = "true".equalsIgnoreCase(v);

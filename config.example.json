@@ -2,7 +2,10 @@
   "enabled": true,
   "mode": "trial",
   "expiry": "2099-12-31",
+  "offline": true,
   "block_update": true,
   "assume_root": true,
+  "force_pro": true,
+  "trace_ipc": false,
   "debug": false
 }

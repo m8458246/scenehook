@@ -1,114 +1,168 @@
 # SceneHook
 
-让 **Scene**（`com.omarea.vtools`）恒处于「已激活的完整试用状态」的 LSPosed 模块，
-不用再改系统日期。
+让 **Scene**（`com.omarea.vtools`）恒处于「已激活的完整 Pro」，并且**彻底不联网**，
+变成一个纯本地工具。不用再改系统日期，也不用担心某天打开 App 被清掉授权。
 
-- 目标版本：Scene **9.4.11**（versionCode `920260809`）
+- 目标版本：Scene **9.4.11**（versionCode `920260809`，targetSdk 30，单 dex 4525 类）
 - 模块 API：libxposed **API 102**（LSPosed 2.2.x）
-- 产物：`scenehook.apk`，约 20 KB，纯反射实现，不打包目标 App 的任何类
+- 产物：`scenehook.apk`，约 25 KB，纯反射实现，不打包目标 App 的任何类
+- 签名固定（仓库内含 `app/keystore.jks`），覆盖安装不会丢 LSPosed 的启用状态
 
 ---
 
-## 一、逆向结论：授权是怎么判的
+## 一、逆向结论
 
-### 1.1 入口链路
+分析方式：MT 管理器 MCP（`mt_apk_*` 的 dex 检索 / 伪代码 / 资源表）+ jadx 全量反编译对照。
+所有结论都能在下面标出的类名里对上。
+
+### 1.1 授权链路（全在 Java 层）
 
 ```
 ActivityStartSplash$h.run()
-  └─ new a.dp0(appContext).d()            ← 授权状态机出口，返回 ActivatedStateModel
-       ├─ type     = a.t01.b()            ← SharedPreferences["activate_v2_type"]
-       └─ text     = a.dp0.c(label)       ← 真正判断"过没过期"的地方
-             └─ a.cp0.c()
-                  └─ a.q50.A(prefs["random_id2"])
-                        └─ 拿激活码请求服务端，返回 "success@<到期毫秒>" / "expired" / "invalid" / "not-you"
+  └─ new a.dp0(ctx).d()                    → ActivatedStateModel（启动分流用）
+       ├─ type = a.t01.b()                  prefs["global"]["activate_v2_type"]
+       └─ text = a.dp0.c(label)
+            └─ a.cp0.toString()
+                 └─ a.wm0#b()               进程内内存缓存（LinkedHashMap）
+                      └─ a.cp0#c()          → a.q50.A(prefs["global"]["random_id2"])
+                           └─ O0("activate", code, 2500)
+                                └─ socket → scene-daemon → HTTP → "success@<到期毫秒>"
+                                                                    / "expired" / "invalid" / "not-you"
 ```
 
-`a.q50.A(String)` 的实现（反编译）：
+关键点：
 
-```java
-public final String A(String code) {
-    byte[] b = code.getBytes(Charset.defaultCharset());
-    long start = System.currentTimeMillis();
-    while (true) {
-        String r = O0("activate", new String(b, xe2.a), 2500L);   // 打服务端
-        if (!"error".equals(r)) return r;
-        Thread.sleep(300);
-        if (System.currentTimeMillis() - start >= 6000) return "error";
-    }
-}
-```
+1. **本地没有任何「当前时间 vs 到期时间」的比较**。判决 100% 在服务端完成，
+   而请求里带的是**客户端本地时间**——这才是「改系统日期能续试用期」的真正原因。
+   所以单纯 hook `System.currentTimeMillis()` 一点用都没有。
+2. `a.dp0#c(String)` 只做前缀解析：`success@<ts>` → 已激活；其余一律未激活。
+3. 状态消费点只有 3 个：
+   | 调用点 | 作用 |
+   |---|---|
+   | `ActivityStartSplash#h.run()` | 启动分流：已激活走正常流程，否则走提示页 |
+   | `a.v12#Z1()` | 「关于 / 授权」页 |
+   | `a.q02#b()` | 激活码兑换结果提示 |
+4. **`ActivityMain` 每次打开都会复验一次**：
 
-### 1.2 为什么"改系统日期"能生效
+   ```java
+   String code = t01.a();                       // prefs["global"]["random_id2"]
+   if (code != null && code.length() > 0) {
+       String r = q50.A(code);                  // ← 每次都问一次
+       if (r.equals("expired") || r.equals("invalid") || r.equals("not-you")) {
+           toast("授权已过期 [" + r + "]");
+           t01.E0(null);                        // 清空 random_id2
+           t01.F0(null);                        // 清空 activate_v2_type
+       }
+   }
+   ```
 
-服务端拿不到你的真实时间——请求参数里带的是**客户端本地时间**：
+   这就是「模块没生效时，打开一次就被清掉授权」的机制。也是必须 hook `q50#A` 而不是
+   只改界面的原因。
 
-| 接口 | 时间参数 |
+### 1.2 网络面：只有 5 个入口，全部落到 `URL#openConnection`
+
+| 入口 | 用途 |
 |---|---|
-| `a.q50.A` → `activate` | 客户端当前时间参与构造 |
-| `a.zq0.A` → `/release-activate2` | `request_time = new Date().getTime()` |
+| `a.h60` | HTTP 客户端基类（`b/m/k/i` 内部都是 `new URL(str).openConnection()`），6 个子类见下 |
+| `a.aq0` | 基础地址 + 连通性探测（`omarea.com` / `scene7.omarea.com:8080` / `vtools.online`） |
+| `a.zq0` | `/release-activate2`、`/account-bind`、`/account-unbind`、`/account-set-main` |
+| `a.tp0` | `download.omarea.com/toolkit/*`（守护进程更新）、`/cloud-scheduler2`、`/cloud-scheduler-v2`、`/cloud-scheduler-threads` |
+| `a.jp0` | `/scene-magisk-*`（Magisk 模块仓库） |
+| `a.op0` | `/pvp/*`（跑分上报） |
+| `a.iq0` | 云端配置同步 |
+| `a.pk0` | 直接 `openConnection`：`magisk-modules-repo.github.io/submission/modules.json` |
+| `a.kq0` | 直接 `openConnection`：`vtools.oss-cn-beijing.aliyuncs.com/vi/Scene9.json`（版本信息） |
+| `a.rs1` | 直接 `openConnection`：`vi/lastversion.json`（更新检查） |
+| `a.ep0` | 直接 `openConnection`：`addin/auto-skip-config-v1.json`（广告跳过配置） |
 
-服务端用这个时间跟授权到期时间比，得出 `pass` / `expired`。
-所以把日期拨到 2026-08-15（试用期内），服务端就回 `success@...`，App 自然满血。
-这正是实测现象，不是错觉。
+所以在 `java.net.URL#openConnection` 这一层设卡，一次覆盖全部。
+只拦 `http/https`，`file:` / `jar:` 原样放行；WebView 走 native 栈，不在拦截范围
+（用户主动点链接仍能打开网页，这是有意的）。
 
-### 1.3 状态是怎么落地的
+### 1.3 守护进程（scene-daemon）
 
-`a.dp0.c(String)` 只看返回串的前缀：
+- 就是 APK 里的 **`res/raw/daemon`**：2.28 MB、aarch64 静态 ELF、**整个正文熵 8.0、
+  没有任何可读字符串**，是加密/自解密的二进制。首次启动时由 `a.ym0#b()` 释放到
+  `files/scene-daemon`，用 `res/raw/up.sh` + busybox 以 root 起，监听 `127.0.0.1:14754`。
+- **它不需要联网下载**（`a.tp0#z` 那个下载只是「升级守护进程」用的）。
+  所以断网之后完整功能照旧可用，这一点已经用资源表核对过：`R.raw.daemon = 0x7f110003`。
+- 协议是「4 字节长度 + 密文」，密钥来自 **`MD5(本 App 签名)`**：
+  `a.q50#i0(ctx)` 把签名摘要写进 `q50.d`，`a.q50#H(String)` 用它加密每条 IPC 消息。
+  **这就是唯一的防篡改机制**——重打包 / 重签名会让守护进程解不开消息、直接连不上。
+  结论：**必须走运行时 hook，不能改包**。
+- 它自己也会发 HTTP（`activate`、`download-profile` 两个 API），Java 层 hook 管不到
+  另一个进程里的原生代码，所以在 **IPC 出口 `a.q50#O0`** 上拦。
 
-```java
-if (value.startsWith("success@")) {
-    long ts = Long.parseLong(value.substring(value.indexOf('@') + 1));
-    if (ts < 1_000_000_000_000L) ts *= 1000;      // 秒 → 毫秒
-    model.setActivated(true);
-    model.setText(label + new SimpleDateFormat("yyyy-MM-dd").format(new Date(ts)));
-} else if (value.equals("expired")) {
-    model.setActivated(false);                     // 顺手清掉 prefs
-} else if (value.equals("empty")) {
-    model.setActivated(false);
-} else {
-    model.setActivated(false);                     // invalid / not-you / 其他
-}
-```
+### 1.4 检测面：没有
 
-**注意：本地没有任何"当前时间 vs 到期时间"的比较**。整个判定 100% 在服务端完成。
-所以单纯 hook `System.currentTimeMillis()` 是**没用**的——时间根本没参与本地比较。
+对全量 dex 和 `lib/arm64-v8a/libnative-lib.so` 做了关键词普查：
 
-### 1.4 全 App 只有 3 个地方消费授权状态
-
-`ActivatedStateModel.getActivated()` 的调用点（dispatch xref 全量）：
-
-| 调用点 | 作用 |
+| 关键词 | 命中 |
 |---|---|
-| `ActivityStartSplash$h.run()` | 启动分流：已激活走正常流程，否则走提示流程 |
-| `v12.Z1()` | 「关于/授权」页面显示 |
-| `q02.b(String,String)` | 激活码提交后的结果提示 |
+| `Xposed` / `frida` / `LSPosed` / `de.robv` | 0（只有 Material 的 `exposed_dropdown_menu` 之类误报，以及 `R.string.menu_xposed_app` 这种**没有被任何代码引用的死资源**） |
+| `TracerPid` / `/proc/self/maps` / `ptrace` | 0 |
+| `isDebuggerConnected` / `isEmulator` / `ro.debuggable` | 0 |
+| `isRoot` / `checkRoot` | 0（只有 `ActivityQuickStart$checkRoot` 这种**自己的**提权流程，不是检测） |
+| 自签名校验 | 无（`a.c70` 是给**别的应用**算签名用的） |
+| `libnative-lib.so` | 5.8 KB，无可读字符串，纯 JNI 桩 |
 
-字符串 `"trial"` 在整个 dex 里只出现在 `a.dp0.d()`；`"expired"` 只出现在 `a.dp0` 和
-`ActivityMain$a`（激活码兑换流程）。也就是说**没有第二套隐藏的功能门禁**，
-把 `activated` 按住为 true 就够。
+也就是说：**Scene 本身不做反调试 / 反 root / 反 hook**。断网之后连服务端都没有了，
+「被检测」这条路径是彻底堵死的。
+
+### 1.5 还有一个免费版开关
+
+`AndroidManifest` 里 `<meta-data android:name="free_version" android:value="false"/>`，
+`a.a30#c()` 读它（`true` = 专业包），`a.a30#b()` 是它的反。
+免费包会在 `ActivityStartSplash#H()` 里把「Root 模式」入口 `setVisibility(8)`。
+当前装的是 Pro 包，不受影响；模块顺手把它也按住了，防止哪天误装免费包。
 
 ---
 
 ## 二、Hook 设计
 
-不碰网络、不改包、不动目标 App 的数据目录，全部是运行时拦截。
+不碰网络栈之外的东西、不改包、不动目标 App 的数据目录，全部是运行时拦截。
+
+### 2.1 授权（`LicenseHooks`，10 个）
 
 | # | Hook 点 | 做法 | 目的 |
 |---|---|---|---|
-| 1 | `a.q50.A(String)` | 直接返回 `"success@" + <远期时间戳>` | **主判决**。短路服务端，同时省掉启动时最多 6 秒的重试等待 |
-| 2 | `a.dp0.d()` | `proceed()` 后改写结果 | 兜底：prefs 里是空/异常时也返回已激活 |
-| 3 | `a.dp0.c(String)` | `proceed()` 后改写结果 | 兜底：被别处直接调用时同样生效 |
-| 4 | `a.t01.b()` | 空 / `expired` / `free` / `unknown` → `"trial"` | 保证 `d()` 走试用分支，界面显示 `Pro(Trial)` |
-| 5 | `ActivatedStateModel.getActivated()` | 恒返回 `true` | 最后一道保险，覆盖全部 3 个消费点 |
+| 1 | `a.q50#A(String)` | 返回 `"success@" + <expiry 毫秒>` | **主判决**。短路守护进程与 HTTP，同时省掉启动时最多 6 秒的重试等待；覆盖 `ActivityMain` 的每次复验 |
+| 2 | `a.q50#O0(String,String,Long)` | `activate` → success；`download-profile` → `"{}"` | 管住守护进程那一侧：不它让发 HTTP，也不再等 15 秒超时 |
+| 3 | `a.dp0#d()` | `proceed()` 后改写结果 | 兜底：prefs 空/异常时也返回已激活 |
+| 4 | `a.dp0#c(String)` | `proceed()` 后改写结果 | 兜底：被别处直接调用时同样生效 |
+| 5 | `a.t01#b()` | 空 / `expired` / `free` / `unknown` → `trial` | 保证 `d()` 走试用分支，界面显示 `Pro(Trial)` |
+| 6 | `ActivatedStateModel#getActivated()` | 恒 `true` | 最后一道保险，覆盖全部消费点 |
+| 7 | `a.zq0#A()` | 返回 `null` | 跳过启动时那次 `/release-activate2`。原实现自己在网络失败时也 `return null`，语义一致 |
+| 8 | `a.q50#h0()` | `basic` → 上次成功的 `working_mode` | 修 Scene 自己的启动竞态（见第五节） |
+| 9 | `a.a30#b()` | `false` | 免费版标志位 |
+| 10 | `a.a30#c()` | `true` | 免费版标志位 |
 
-改写结果时会把 `text` / `typeName` 一起修好，文案从 App 自己的字符串资源里按**名字**取
-（`getIdentifier("license_expiry", ...)`），不写死 resource id，换版本不会错位。
+改写结果时会把 `text` / `typeName` / `permanent` 一起修好，文案从 App 自己的字符串资源里
+按**名字**取（`getIdentifier("license_expiry"|"license_trial"|"license_perpetual")`），
+不写死 resource id，换版本不会错位。实测文案就是 App 原本的 `Date of expiry:` + 日期，
+和真授权完全一致。
 
-设计原则（沿用过往项目踩坑经验）：
+### 2.2 断网（`NetworkGate`，2 个）
+
+| # | Hook 点 | 做法 |
+|---|---|---|
+| 11 | `java.net.URL#openConnection()` | `http/https` → `throw new IOException("scenehook:offline <host>")` |
+| 12 | `java.net.URL#openConnection(Proxy)` | 同上 |
+
+抛 `IOException` 而不是返回空对象，是因为这本来就是「网络不可用」的既有语义：
+`a.h60#b/m/p/h` 都声明了 `throws IOException`，其余 4 个直接调用的类全部包在
+`try/catch` 里，`a.h60#k/i` 内部自己 catch 后返回 `null`。不会崩。
+
+装完会**自检**：从模块自己的代码里 `new URL("http://127.0.0.1:1/...").openConnection()`，
+必须抛出的异常信息里带 `scenehook:offline` 才算闸门生效。用 127.0.0.1:1 是为了万一
+hook 没装上，也只是一次本地端口拒绝，不会真的产生外网流量。
+
+### 2.3 设计原则
 
 - 所有 `hook()` 各自 `try/catch`，失败只打 `WARN` 不抛——绝不能把目标 App 带崩
-- 类名找不到就静默降级，不阻塞其余 hook
+- 类名/方法名找不到就静默降级，不阻塞其余 hook
 - 多进程 / 重复回调用静态标志防重入，避免 hook 串链
+- `enabled=false` 时全部直接 `proceed()`，等于原版行为
 - 装完立刻自检并打日志，不用等用户点进设置页
 
 ---
@@ -127,8 +181,11 @@ if (value.startsWith("success@")) {
   "enabled": true,
   "mode": "trial",
   "expiry": "2099-12-31",
+  "offline": true,
   "block_update": true,
   "assume_root": true,
+  "force_pro": true,
+  "trace_ipc": false,
   "debug": false
 }
 ```
@@ -136,14 +193,21 @@ if (value.startsWith("success@")) {
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 关掉后全部 hook 直接 `proceed()`，等于原版行为 |
-| `mode` | `trial` | `trial` = 永远试用期（显示 Pro(Trial)）；`perpetual` = 永久授权（显示 Pro(Permanent)） |
+| `mode` | `trial` | `trial` = 永远试用期（显示 `Pro(Trial)`）；`perpetual` = 永久授权（显示 `Pro(Permanent)`） |
 | `expiry` | `2099-12-31` | 展示用的到期日，同时换算成时间戳喂给判决 |
-| `block_update` | `true` | 掐断 `/release-activate2` 与 `download-profile`，保住本地 profile，启动不再等 15 秒超时 |
-| `assume_root` | `true` | 修复"首次进入显示基础功能、退出重进才恢复 root"的启动竞态 |
-| `debug` | `false` | 打开后打印每次 daemon IPC 的 API 名与耗时，用来定位"慢在哪" |
+| `offline` | `true` | **v2 新增**。在 `URL#openConnection` 上断掉全部 http/https |
+| `block_update` | `true` | 掐断 `/release-activate2` 与 `download-profile`，保住本地 profile，启动不再等超时 |
+| `assume_root` | `true` | 修复「首次进入显示基础功能、退出重进才恢复」的启动竞态 |
+| `force_pro` | `true` | **v2 新增**。免费版标志位强制为专业版 |
+| `trace_ipc` | `false` | **v2 新增**。打印每个 app↔daemon 的 API 名（去重），用来确认没有漏网的联网 API |
+| `debug` | `false` | 打印每次 IPC 的 API 名与耗时 |
 
-文件不存在时用内置默认值（即已启用、试用期到 2099-12-31），**开箱即用，不建文件也行**。
+文件不存在时用内置默认值（即：已启用、试用期到 2099-12-31、断网），**开箱即用，不建文件也行**。
 配置有 3 秒 TTL，改完不用重启 App。
+
+> 想临时联网（比如首次装完想拉一次云端 profile）：把 `offline` 和 `block_update` 都置 `false`，
+> 打开一次 Scene 让它在性能页拉完配置，再改回来。拉过一次之后本地就有
+> `files/powercfg.sh` + `files/manifest.json`，之后永久断网也不影响。
 
 ---
 
@@ -157,20 +221,19 @@ if (value.startsWith("success@")) {
 https://github.com/m8458246/scenehook/releases/download/latest/scenehook.apk
 ```
 
-打 tag（`v1.0.0`）则发对应版本 release。
-
-> 下载 Release 资产时若怀疑拿到旧包，加个 `?ts=$(date +%s)` 破 CDN 缓存。
+打 tag（`v2.0.0`）则发对应版本 release。下载时若怀疑拿到旧包，加 `?ts=$(date +%s)` 破 CDN 缓存。
 
 ### 4.2 本地类型检查（不跑 Gradle）
 
 ```bash
+curl -sSLO https://repo1.maven.org/maven2/com/google/android/android/4.1.1.4/android-4.1.1.4.jar
+curl -sSLO https://repo1.maven.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0.aar
+unzip -o api-102.0.0.aar classes.jar
+
 javac -nowarn -proc:none --release 17 -encoding UTF-8 \
-  -cp "android-stub.jar:libxposed-api.jar" \
+  -cp "android-4.1.1.4.jar:classes.jar" \
   -d /tmp/tc $(find app/src/main/java -name '*.java')
 ```
-
-`android-stub.jar` 可用 `com.google.android:android:4.1.1.4`，
-`libxposed-api.jar` 是 `io.github.libxposed:api:102.0.0` 这个 AAR 里的 `classes.jar`。
 
 ### 4.3 安装
 
@@ -181,10 +244,8 @@ pm install -r /data/local/tmp/scenehook.apk
 am force-stop com.omarea.vtools
 ```
 
-然后在 **LSPosed 管理器**里启用模块并勾选 `com.omarea.vtools`（这一步需要手动点，
+然后在 **LSPosed 管理器**里启用模块并勾选 `com.omarea.vtools`（这一步必须手动点，
 `lspctl` 没有启用命令，也不要直接改 `modules_config.db`）。
-
-签名固定（仓库内含 `app/keystore.jks`），后续覆盖安装不会丢 LSPosed 的启用状态。
 
 ### 4.4 验证
 
@@ -198,19 +259,27 @@ logcat -s SceneHook:V
 模块加载: process=com.omarea.vtools framework=LSPosed ... api=102
 目标包就绪: com.omarea.vtools
 hook OK: a.q50#A(String)
+hook OK: a.q50#O0(String,String,Long)
 hook OK: a.dp0#d()
 hook OK: a.dp0#c(String)
 hook OK: a.t01#b()  [activate_v2_type]
 hook OK: com.omarea.model.ActivatedStateModel#getActivated()
-SceneHook 安装完成: 5/5 个 hook 生效, 配置来源=default, enabled=true, mode=trial, expiry=2099-12-31
-自检: type=trial, activated=true, 到期=2099-12-31 (4102444799000), text=...
+hook OK: a.zq0#A()
+hook OK: a.q50#h0()
+hook OK: a.a30#b()/#c()  [free_version]
+SceneHook 安装完成: 授权类 10/10 个 hook 生效, 配置来源=default, enabled=true, mode=trial, ...
+自检: type=trial, typeName=Pro(Trial), activated=true, permanent=false, 到期=2099-12-31 (4102444799000), text=Date of expiry:2099-12-31
+hook OK: java.net.URL#openConnection()
+hook OK: java.net.URL#openConnection(Proxy)
+断网 hook: 2/2 生效, 闸门自检=PASS
 ```
 
-打开 Scene → 「关于」页应显示 `Pro(Trial)`，到期日 `2099-12-31`。
+打开 Scene → 「关于」页应显示 `Pro(Trial)` + `Date of expiry:2099-12-31`，
+且整个过程**没有任何一条外网请求**。
 
 ---
 
-## 五、"首次进入是基础功能"的原因
+## 五、「首次进入是基础功能」的原因
 
 这不是模块造成的，是 Scene 自己的启动竞态：
 
@@ -226,44 +295,67 @@ public final boolean Y() {
 所以 App 刚起来时 `h0()` 恒为 `"basic"`，界面先按基础功能渲染；等异步的 root 探测
 （`Z0()` → `e = "root"`）完成后才变完整功能。
 
-更麻烦的是有些界面会在**构造时**就把 `isBasic` 缓存成字段（如 `vx1.t`），
-所以只有"退出重进"才能让新 Activity 在 daemon 就绪后再构造一次。
+更麻烦的是有些界面会在**构造时**就把 `isBasic` 缓存成字段（`a.vx1#t`），
+所以只有「退出重进」才能让新 Activity 在 daemon 就绪后再构造一次。
 
 `assume_root = true` 时，模块在 `h0()` 返回 `"basic"` 时改读 Scene 自己存的
-`working_mode`（只有成功进过 root 才会是 `"root"`），用上次的成功模式顶替，
+`working_mode`（`SharedPreferences("global")` 的 `working_mode`，只有成功进过 root 才会是
+`"root"`，写入点在 `ActivityStartSplash` 的授权弹窗确认回调里），用上次的成功模式顶替，
 首次进入即完整功能。若担心 daemon 真没起来时界面与实际能力不符，可置为 `false`。
 
 ---
 
 ## 六、已知限制
 
-1. **绑定版本**。`a.q50` / `a.dp0` / `a.t01` 是 9.4.11 的混淆名。App 升级后混淆映射会变，
-   需要按「01/05 文档」的方法重新定位：从 `ActivatedStateModel` 的 xref 往上找
-   `dp0.c` → `cp0.c` → `q50.A`，链路很短，几分钟就能重新对上。
+1. **绑定版本**。`a.q50` / `a.dp0` / `a.t01` / `a.zq0` / `a.a30` 是 9.4.11 的混淆名。
+   App 升级后混淆映射会变，需要按下面的路径重新定位（链路很短，几分钟能对上）：
+   `ActivatedStateModel` → xref → `a.dp0` → `a.t01` / `a.q50`；网络面从 `a.h60` 的子类往下找。
 2. **不是真正的离线破解**。模块只是让运行时状态恒为已激活，不伪造授权码、不伪造签名。
-   服务端那边你的授权依然是过期状态；如果 App 以后加了"必须在服务端激活过才给功能"的硬门禁，
-   这套方案需要跟着调整。
-3. **纯本地生效**。不拦截网络，不改任何 prefs，不改 APK。关掉模块即恢复原版行为。
-4. 目标 App 若把授权状态缓存到 native 层（当前版本没有，`lib/` 下只有加密和 sqlite 相关的 so），
-   Java 层 hook 会失效，需要另行处理。
+   服务端那边你的授权依然是过期状态；只是这个 App 再也问不到服务端了。
+3. **守护进程是黑盒**。`res/raw/daemon` 正文全加密，无法静态确认它有没有「自己主动上报」的
+   定时器。目前的证据是：它只响应 app 发来的 API，而 app 侧唯一的 HTTP 出口已经被
+   `URL#openConnection` 掐死、唯一的 IPC 出口也被 `O0` 管住。真要验证，可以在断网状态下
+   用 `ss -tnp` 看 `scene-daemon` 有没有非回环连接（`trace_ipc` 打出来的 API 名可作对照）。
+4. **重签名会让守护进程连不上**（IPC 密钥派生自签名），所以不要改包，只挂模块。
+5. 目标 App 若把授权状态缓存到 native 层（当前版本没有），Java 层 hook 会失效。
 
 ---
 
-## 六、分析用的工具链
+## 七、v1 → v2 变更
 
-- 静态分析：MT 管理器 MCP（`mt_apk_*`）—— dex 类/方法检索、Smali、伪代码、资源表、xref
+| 项 | v1 | v2 |
+|---|---|---|
+| 联网 | 只拦 `download-profile` + `/release-activate2`，其余照旧联网 | `URL#openConnection` 全量拦截 + IPC 出口拦截，双保险；装完自检 |
+| `download-profile` 返回值 | `""`（上层 `new k30("")` 抛异常刷日志） | `"{}"`（合法 JSON，走正常空数据分支） |
+| 授权判决覆盖 | 靠 `dp0` 改写 | 增加 `ActivityMain` 每次复验路径的说明与验证（`q50#A` 本就覆盖） |
+| 免费版标志 | 未处理 | `a.a30#b()/#c()` |
+| 排查手段 | `debug` | 新增 `trace_ipc`（API 名去重打印） |
+| 自检 | 只验状态模型 | 状态模型 + 断网闸门双重自检 |
+| 文档 | 授权链路 | 补全网络面全清单、守护进程机制、检测面普查结论 |
+
+---
+
+## 八、分析用的工具链
+
+- 静态分析：MT 管理器 MCP（`mt_apk_*`）—— dex 类/方法检索、伪代码、资源表、xref
 - 关键命令：
-  - `mt_apk_search` target=`dex_names` / `dex_strings` —— 先按关键词定位「有没有」
-  - `mt_apk_dex_xref` —— 从数据模型反推生产者和消费者，比按名字猜快得多
+  - `mt_apk_search` target=`dex_strings` / `dex_names` —— 先按关键词定位「有没有」
   - `mt_apk_resource_read` —— 确认字符串资源语义（`license_expiry` = `"Date of expiry:"`）
+  - `mt_apk_workspace_open` + jadx 全量反编译 —— 批量 grep 比逐类翻快得多
 - 混淆名反推路径（本次实际走的）：
 
 ```
-ActivatedStateModel  (语义清晰的 model 类，未混淆)
-  └─ xref new-instance → a.dp0.c(String)          ← 6 个分支 = 状态机
-       └─ 读 a.t01.b() / a.cp0.c()
-            └─ a.q50.A(String)                     ← 唯一的判决出口
+ActivatedStateModel（语义清晰，未混淆）
+  └─ xref new-instance → a.dp0.c(String)        ← 6 个分支 = 状态机
+       ├─ 读 a.t01.b() / a.cp0（wm0 内存缓存）
+       └─ a.q50.A(String)                        ← 唯一的判决出口
+网络面：
+  grep "openConnection" → a.h60（基类）+ a.pk0 / a.kq0 / a.rs1 / a.ep0
+  grep "extends h60"    → aq0 / zq0 / tp0 / jp0 / op0 / iq0
+守护进程：
+  grep "scene-daemon"   → a.q50（IPC 客户端）、a.tp0（升级下载）、a.ym0（解包）
+  资源表 R.raw.daemon   → 内置 2.28MB ELF，不需要联网
 ```
 
 **结论：混淆不可怕，从一个语义明确的数据模型出发，往上追生产者、往下追消费者，
-两头一夹就出来了。**
+两头一夹就出来了；网络面则反过来，从最底层的 `URL.openConnection` 往上找调用者，一遍就全了。**
