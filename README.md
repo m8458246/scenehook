@@ -165,6 +165,30 @@ hook 没装上，也只是一次本地端口拒绝，不会真的产生外网流
 - `enabled=false` 时全部直接 `proceed()`，等于原版行为
 - 装完立刻自检并打日志，不用等用户点进设置页
 
+### 2.4 一个必须知道的坑：`ExceptionMode` 默认是 PROTECTIVE
+
+第一版把断网闸门写成「在 hook 里 `throw new IOException(...)`」，装上去之后日志是：
+
+```
+W LSPosedFramework: Exception in hooker
+W java.io.IOException: scenehook:offline 127.0.0.1
+断网 hook: 2/2 生效, 闸门自检=FAIL
+```
+
+异常确实抛了，但**没到调用方**——libxposed 的 `HookBuilder` 默认 `ExceptionMode.PROTECTIVE`，
+hook 里抛出的异常会被框架吃掉、记一条 WARN，然后回退到原方法（或给个默认值）。
+结果就是「看着拦住了，其实没拦住」。
+
+解法：给这两个 hook 显式加
+
+```java
+.setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+```
+
+所以凡是「靠抛异常来实现」的 hook（断网、拒绝执行、越权），都必须显式 PASSTHROUGH；
+反过来，纯返回值改写的 hook 保持默认 PROTECTIVE 更安全（自己写崩了不会连累目标 App）。
+自检也改成了三态（`PASS` / `DEGRADED` / `FAIL`），能区分「抛了但被吞」和「真没拦住」。
+
 ---
 
 ## 三、配置
@@ -255,9 +279,9 @@ logcat -s SceneHook:V
 
 正常应看到：
 
+（下面这段是 2.0.2 在 ColorOS / LSPosed 2.2.1 / 中文环境下实测的原始输出）
+
 ```
-模块加载: process=com.omarea.vtools framework=LSPosed ... api=102
-目标包就绪: com.omarea.vtools
 hook OK: a.q50#A(String)
 hook OK: a.q50#O0(String,String,Long)
 hook OK: a.dp0#d()
@@ -267,15 +291,29 @@ hook OK: com.omarea.model.ActivatedStateModel#getActivated()
 hook OK: a.zq0#A()
 hook OK: a.q50#h0()
 hook OK: a.a30#b()/#c()  [free_version]
-SceneHook 安装完成: 授权类 10/10 个 hook 生效, 配置来源=default, enabled=true, mode=trial, ...
-自检: type=trial, typeName=Pro(Trial), activated=true, permanent=false, 到期=2099-12-31 (4102444799000), text=Date of expiry:2099-12-31
+SceneHook 安装完成: 授权类 10/10 个 hook 生效, 配置来源=default, enabled=true, mode=trial,
+                    expiry=2099-12-31, offline=true, blockUpdate=true, assumeRoot=true
+自检: type=trial, typeName=, activated=true, permanent=false, 到期=2099-12-31 (4102415999000), text=
 hook OK: java.net.URL#openConnection()
 hook OK: java.net.URL#openConnection(Proxy)
 断网 hook: 2/2 生效, 闸门自检=PASS
+自检(延迟): typeName=专业版(Trial), text=有效期至:2099-12-31, activated=true
 ```
 
-打开 Scene → 「关于」页应显示 `Pro(Trial)` + `Date of expiry:2099-12-31`，
-且整个过程**没有任何一条外网请求**。
+- `自检` 那一行 `typeName=` / `text=` 是空的，是因为 `onPackageReady` 触发时
+  `ActivityThread.currentApplication()` 还是 null，拿不到 Context 查不到字符串资源；
+  紧接着的 `自检(延迟)` 会等 Application 出现后补一次，用来证明「按名字取资源」这条路通。
+- 文案随系统语言变化（中文是 `专业版(Trial)` / `有效期至:`，英文是 `Pro(Trial)` / `Date of expiry:`），
+  都是 App 自己的资源，不是模块写死的。
+- 断网闸门自检 `PASS` 表示：模块自己发起的 `http://127.0.0.1:1/` 请求确实被自己的 hook
+  以 `IOException: scenehook:offline` 拦下了。
+
+再确认一下真的没有外网连接（只应看到 app↔daemon 的 127.0.0.1 回环）：
+
+```bash
+for f in /proc/net/tcp /proc/net/tcp6; do awk 'NR>1 && $8==10048' $f; done
+# 10048 是 com.omarea.vtools 的 uid，输出的 local/remote 应全是 0100007F（127.0.0.1）
+```
 
 ---
 
