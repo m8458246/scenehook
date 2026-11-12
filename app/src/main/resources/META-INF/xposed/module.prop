@@ -1,6 +1,6 @@
 name=SceneHook
-version=v2.0.1
-versionCode=6
+version=v2.0.2
+versionCode=7
 description=Scene 恒处于已激活的完整 Pro，并彻底断网成为本地工具
 minApiVersion=101
 targetApiVersion=102

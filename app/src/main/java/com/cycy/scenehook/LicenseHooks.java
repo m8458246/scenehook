@@ -127,6 +127,7 @@ final class LicenseHooks {
                 + ", blockUpdate=" + c.blockUpdate
                 + ", assumeRoot=" + c.assumeRoot);
         selfCheck();
+        deferredSelfCheck();
     }
 
     // ---------------------------------------------------------------- hooks
@@ -621,6 +622,46 @@ final class LicenseHooks {
                 + ", permanent=" + get(model, "getPermanent")
                 + ", 到期=" + c.expiry + " (" + c.expiryMillis() + ")"
                 + ", text=" + get(model, "getText"));
+    }
+
+    /**
+     * onPackageReady 触发时 Application 还没建好（ActivityThread.currentApplication() 为 null），
+     * 拿不到 Context 就查不到字符串资源，自检里的 typeName/text 会是空的。
+     * 这里起一个一次性守护线程，等 Application 出现后再补一次自检，
+     * 用来确认「按名字取资源」这条路真的通——资源名变了能第一时间从日志看出来。
+     */
+    private void deferredSelfCheck() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < 60; i++) {
+                    if (app() != null) break;
+                    try {
+                        Thread.sleep(100L);
+                    } catch (InterruptedException ignored) {
+                        return;
+                    }
+                }
+                Application a = app();
+                if (a == null) {
+                    module.log(Log.WARN, TAG, "自检(延迟): 始终拿不到 Application，文案解析未验证");
+                    return;
+                }
+                try {
+                    Object model = newState();
+                    if (model == null) return;
+                    Config c = Config.current();
+                    forceActivated(model, a, c);
+                    module.log(Log.INFO, TAG, "自检(延迟): typeName=" + get(model, "getTypeName")
+                            + ", text=" + get(model, "getText")
+                            + ", activated=" + get(model, "getActivated"));
+                } catch (Throwable th) {
+                    module.log(Log.WARN, TAG, "自检(延迟) 失败: " + th);
+                }
+            }
+        }, "SceneHook-selfcheck");
+        t.setDaemon(true);
+        t.start();
     }
 
     private String get(Object target, String name) {
