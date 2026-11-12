@@ -215,7 +215,8 @@ final class LicenseHooks {
                         } catch (Throwable t) {
                             long ms = (System.nanoTime() - start) / 1_000_000L;
                             module.log(Log.WARN, TAG, "O0(" + api + ") " + ms + "ms 抛异常: " + t);
-                            throw t;
+                            // 不重抛：PROTECTIVE 模式下重抛会让框架回退到原方法，等于再发一次 IPC
+                            return null;
                         }
                     });
             installed++;
@@ -519,7 +520,9 @@ final class LicenseHooks {
 
     /** 资源文案只解析一次，之后走缓存 —— 避免每次状态刷新都做一次 getIdentifier。 */
     private void resolveStrings(Context ctx) {
-        if (sResolved || ctx == null) return;
+        if (sResolved) return;
+        if (ctx == null) ctx = app();   // 自检时 dp0 实例还没有，退回进程级 Application
+        if (ctx == null) return;
         synchronized (LicenseHooks.class) {
             if (sResolved) return;
             sExpiryLabel = resString(ctx, RES_EXPIRY);
@@ -561,6 +564,7 @@ final class LicenseHooks {
     /** 从 a.dp0 实例上把 Context 字段摸出来（混淆后有两个同名 a 字段，按类型筛）。 */
     private Context findContext(Object owner) {
         if (owner == null) return null;
+        if (owner instanceof Context) return (Context) owner;
         Class<?> c = owner.getClass();
         while (c != null && c != Object.class) {
             for (Field f : c.getDeclaredFields()) {
@@ -610,7 +614,7 @@ final class LicenseHooks {
             module.log(Log.WARN, TAG, "自检失败: 无法构造 " + CLS_STATE);
             return;
         }
-        forceActivated(model, null, c);
+        forceActivated(model, app(), c);
         module.log(Log.INFO, TAG, "自检: type=" + get(model, "getType")
                 + ", typeName=" + get(model, "getTypeName")
                 + ", activated=" + get(model, "getActivated")

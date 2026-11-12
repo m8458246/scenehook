@@ -59,6 +59,6 @@ public final class ModuleMain extends XposedModule {
         }
 
         log(Log.INFO, TAG, "断网 hook: " + net + "/2 生效, 闸门自检="
-                + (c.offline ? (NetworkGate.verify() ? "PASS" : "FAIL") : "skip"));
+                + (c.offline ? NetworkGate.verify() : "skip"));
     }
 }

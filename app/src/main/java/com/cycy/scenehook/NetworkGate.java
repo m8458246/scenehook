@@ -70,6 +70,7 @@ final class NetworkGate {
             m.setAccessible(true);
             module.hook(m)
                     .setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
                     .setId("scenehook_net_open")
                     .intercept(chain -> {
                         Object self = chain.getThisObject();
@@ -96,6 +97,7 @@ final class NetworkGate {
             m.setAccessible(true);
             module.hook(m)
                     .setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
                     .setId("scenehook_net_open_proxy")
                     .intercept(chain -> {
                         Object self = chain.getThisObject();
@@ -131,17 +133,24 @@ final class NetworkGate {
      *
      * 目标固定成 127.0.0.1:1 —— 万一 hook 没装上，也只是一次本地端口拒绝，
      * 不会真的产生外网流量。
+     *
+     * 注意：libxposed 默认的 ExceptionMode 是 PROTECTIVE（hook 里抛的异常会被框架
+     * 吃掉并回退到原方法），所以这里必须显式 PASSTHROUGH，否则 IOException 到不了调用方，
+     * App 拿到的是「连接成功/空对象」，等于没拦住。
+     *
+     * 返回：PASS / DEGRADED（抛了但被框架吞掉，拿到了 null）/ FAIL（真的连出去了）
      */
-    static boolean verify() {
+    static String verify() {
         try {
             URL url = new URL("http://127.0.0.1:1/scenehook-selftest");
-            url.openConnection();
-            return false; // 没被拦，说明闸门没生效
+            Object conn = url.openConnection();
+            // 没抛异常：要么 hook 没装上，要么异常被框架吞掉返回了 null
+            return conn == null ? "DEGRADED" : "FAIL";
         } catch (IOException e) {
             String msg = String.valueOf(e.getMessage());
-            return msg.contains(REASON);
+            return msg.contains(REASON) ? "PASS" : "FAIL:" + msg;
         } catch (Throwable t) {
-            return false;
+            return "FAIL:" + t;
         }
     }
 }
